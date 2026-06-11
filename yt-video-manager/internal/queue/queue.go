@@ -5,7 +5,7 @@
 package queue
 
 // status will be like lifecycle state of Q'ed items
-type Status String
+type Status string
 
 const ( 
 	Pending Status = "pending"
@@ -28,13 +28,13 @@ type Item struct {
 
 type Queue struct { 
 	items []*Item
-	nextId int 
+	nextID int 
 }
 
-func New() *Queue { return &Queue{nextId:1}}
+func New() *Queue{ return &Queue{nextID:1}}
 
-func( q*Queue) Add(url string ) *Item { 
-	it := &Item { ID: q.nextID, URL: url, Status: Pending}
+func(q *Queue) Add(url string ) *Item { 
+	it := &Item{ID: q.nextID, URL: url, Status: Pending}
 	q.nextID++
 	q.items = append(q.items, it)
 	return it
@@ -54,7 +54,7 @@ func ( q *Queue) Get(id int) *Item {
 func  ( q *Queue) Remove(id int) bool { 
 	for i, it := range q.items { 
 		if it.ID == id { 
-			q.items = append(q.items[:i], q.items[i+1:]....)
+			q.items = append(q.items[:i], q.items[i+1:]...)
 			return true
 		}
 	}

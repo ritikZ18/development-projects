@@ -13,8 +13,11 @@ import (
 
 	"ytm/internal/config"
 	"ytm/internal/queue"
+	"ytm/internal/web"
 	"ytm/internal/ytdlp"
 )
+
+const watchAddr = ":8080"
 
 // ----- styles -----
 
@@ -33,9 +36,11 @@ var (
 var commands = []struct{ name, desc string }{
 	{"/add", "add one or more links to the queue"},
 	{"/check", "fetch titles for pending links"},
+	{"/quality", "set quality: best|1080|720|480|audio"},
+	{"/download", "download everything in the queue"},
+	{"/files", "list downloaded files on disk"},
 	{"/list", "show how many items are queued"},
 	{"/folder", "set or show the download folder"},
-	{"/download", "download everything in the queue"},
 	{"/remove", "remove an item by id"},
 	{"/clear", "empty the queue"},
 	{"/help", "list the commands"},
@@ -70,7 +75,7 @@ type model struct {
 	events chan tea.Msg // background goroutines push progress/done here
 }
 
-// Run sets up config and starts the program.
+// Run sets up config, starts the watch server, and runs the TUI.
 func Run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -79,6 +84,9 @@ func Run() error {
 	if err := os.MkdirAll(cfg.DownloadDir, 0o755); err != nil {
 		return err
 	}
+
+	// watch UI in the background; serves the folder we start with
+	go func() { _ = web.Serve(watchAddr, cfg.DownloadDir) }()
 
 	p := tea.NewProgram(newModel(cfg), tea.WithAltScreen())
 	_, err = p.Run()
@@ -119,9 +127,9 @@ func checkCmd(id int, url string) tea.Cmd {
 
 func (m model) startDownload(it *queue.Item) {
 	events := m.events
-	id, url, dir := it.ID, it.URL, m.cfg.DownloadDir
+	id, url, dir, quality := it.ID, it.URL, m.cfg.DownloadDir, m.cfg.Format
 	go func() {
-		err := ytdlp.Download(context.Background(), url, dir, func(p float64, _ string) {
+		err := ytdlp.Download(context.Background(), url, dir, quality, func(p float64, _ string) {
 			events <- progressMsg{id: id, percent: p}
 		})
 		events <- downloadDoneMsg{id: id, err: err}
@@ -211,6 +219,27 @@ func (m model) handleSubmit() (model, tea.Cmd) {
 	case "/check":
 		return m.checkItems(args)
 
+	case "/quality":
+		if len(args) == 0 {
+			m.log = append(m.log, "quality: "+m.cfg.Format+"  (best|1080|720|480|audio)")
+			return m, nil
+		}
+		switch args[0] {
+		case "best", "1080", "720", "480", "360", "audio":
+			m.cfg.Format = args[0]
+			_ = m.cfg.Save()
+			m.log = append(m.log, "quality set to "+args[0])
+		default:
+			m.log = append(m.log, "unknown quality (best|1080|720|480|audio)")
+		}
+		return m, nil
+
+	case "/download":
+		return m.downloadAll()
+
+	case "/files":
+		return m.listFiles()
+
 	case "/list":
 		m.log = append(m.log, fmt.Sprintf("%d item(s) in queue", m.q.Len()))
 		return m, nil
@@ -226,12 +255,9 @@ func (m model) handleSubmit() (model, tea.Cmd) {
 		if err := m.cfg.Save(); err != nil {
 			m.log = append(m.log, "could not save config: "+shortErr(err))
 		} else {
-			m.log = append(m.log, "folder set to "+rest)
+			m.log = append(m.log, "folder set to "+rest+" (restart to update the watch page)")
 		}
 		return m, nil
-
-	case "/download":
-		return m.downloadAll()
 
 	case "/remove":
 		if len(args) == 0 {
@@ -256,7 +282,7 @@ func (m model) handleSubmit() (model, tea.Cmd) {
 		return m, nil
 
 	case "/help":
-		m.log = append(m.log, "commands: /add /check /list /folder /download /remove /clear /quit")
+		m.log = append(m.log, "commands: /add /check /quality /download /files /list /folder /remove /clear /quit")
 		return m, nil
 
 	case "/quit", "/exit":
@@ -331,7 +357,33 @@ func (m model) downloadAll() (model, tea.Cmd) {
 		m.log = append(m.log, "nothing to download")
 		return m, nil
 	}
-	m.log = append(m.log, fmt.Sprintf("downloading %d item(s)...", n))
+	m.log = append(m.log, fmt.Sprintf("downloading %d item(s) at %s...", n, m.cfg.Format))
+	return m, nil
+}
+
+func (m model) listFiles() (model, tea.Cmd) {
+	entries, err := os.ReadDir(m.cfg.DownloadDir)
+	if err != nil {
+		m.log = append(m.log, "could not read folder: "+shortErr(err))
+		return m, nil
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		size := int64(0)
+		if info, ierr := e.Info(); ierr == nil {
+			size = info.Size()
+		}
+		m.log = append(m.log, fmt.Sprintf("  %s (%s)", truncate(e.Name(), 44), humanSize(size)))
+		n++
+	}
+	if n == 0 {
+		m.log = append(m.log, "no files in "+m.cfg.DownloadDir)
+	} else {
+		m.log = append(m.log, fmt.Sprintf("%d file(s) in %s", n, m.cfg.DownloadDir))
+	}
 	return m, nil
 }
 
@@ -339,7 +391,8 @@ func (m model) View() string {
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render(" ytm — youtube queue ") + "\n")
-	b.WriteString(dimStyle.Render("folder: "+m.cfg.DownloadDir) + "\n\n")
+	b.WriteString(dimStyle.Render("folder: "+m.cfg.DownloadDir+"   quality: "+m.cfg.Format) + "\n")
+	b.WriteString(dimStyle.Render("watch:  http://localhost"+watchAddr) + "\n\n")
 
 	if m.q.Len() == 0 {
 		b.WriteString(dimStyle.Render("queue is empty — paste a link and press enter, or type /help") + "\n")
@@ -350,10 +403,10 @@ func (m model) View() string {
 	}
 	b.WriteString("\n")
 
-	// Last few log lines.
+	// Last several log lines.
 	start := 0
-	if len(m.log) > 5 {
-		start = len(m.log) - 5
+	if len(m.log) > 10 {
+		start = len(m.log) - 10
 	}
 	for _, l := range m.log[start:] {
 		b.WriteString(dimStyle.Render("· "+l) + "\n")
@@ -420,6 +473,17 @@ func truncate(s string, n int) string {
 		return string(r[:n])
 	}
 	return string(r[:n-1]) + "…"
+}
+
+func humanSize(n int64) string {
+	f := float64(n)
+	units := []string{"B", "KB", "MB", "GB"}
+	i := 0
+	for f >= 1024 && i < len(units)-1 {
+		f /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", f, units[i])
 }
 
 func shortErr(err error) string {
